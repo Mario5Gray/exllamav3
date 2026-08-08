@@ -132,6 +132,7 @@ setup(
     include_package_data=True,
     package_data = {
         "": ["py.typed"],
+        "exllamav3.conversion.standard_cal_data": ["*.utf8"],
     },
     verbose=verbose,
     **setup_kwargs,
