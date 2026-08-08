@@ -1,0 +1,43 @@
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+ARG TORCH_VERSION=2.11.0
+ARG PYTORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu130
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /opt/exllamav3
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv "${VIRTUAL_ENV}" \
+    && python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir \
+        --index-url "${PYTORCH_CUDA_INDEX}" \
+        "torch==${TORCH_VERSION}"
+
+COPY setup.py MANIFEST.in ./
+COPY exllamav3 ./exllamav3
+
+RUN python -m pip install --no-cache-dir .
+
+COPY util/docker_convert.py /usr/local/bin/exllamav3-convert
+
+RUN mkdir -p /models /work /output /cache
+
+WORKDIR /
+ENTRYPOINT ["python", "/usr/local/bin/exllamav3-convert"]
