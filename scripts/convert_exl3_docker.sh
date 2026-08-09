@@ -21,6 +21,7 @@ Common options:
       --parallel-mode     Enable ExLlamaV3 parallel mode
       --shard-size MB     Output shard size in MB
       --head-bits BITS    Bits for lm_head, default is ExLlamaV3's default
+      --override-anyway   Allow resume overrides that may break the existing job
       --cache-dir DIR     Host cache dir, default: ~/.cache/exllamav3-docker
       --selinux-label M   Add Docker SELinux volume label mode, usually z or Z
       --image NAME        Docker image name, default: exllamav3-convert
@@ -114,6 +115,10 @@ while (($#)); do
             [[ $# -ge 2 ]] || die "$1 requires a value"
             convert_args+=("-hb" "$2")
             shift 2
+            ;;
+        --override-anyway|--override_anyway)
+            convert_args+=("--override_anyway")
+            shift
             ;;
         --cache-dir)
             [[ $# -ge 2 ]] || die "$1 requires a value"
