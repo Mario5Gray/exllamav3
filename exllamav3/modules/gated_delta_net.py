@@ -10,6 +10,22 @@ from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
+from .multilinear import SlicedMultiLinear
+import os
+
+# Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
+# one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
+_bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
+# Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
+# EXL3_GDN_PROJ_FP32=1 restores fp32
+_proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
+# KDA's per-channel forget gate and beta logits: separate knob, the decay chain they feed is
+# where fp16 rounding compounds (see the A/B in the docs)
+_gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
+# Prefill conv reads the projection output in place (token-major) instead of a transposed bf16 copy
+_conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -244,17 +260,23 @@ class GDNLayerState:
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched conv-state rewind kernel (ext.batched_conv_rewind),
-        computed without performing any copy. Same gating condition as rewind()'s conv branch."""
+        computed without performing any copy. Same gating condition as rewind()'s conv branch.
+        Addresses are integer arithmetic on the base pointer: a rewind touches every GDN layer
+        of the model, and indexing views cost ~10 us per layer in Python (issue: ~0.5 ms per
+        rejected draft on a 48-layer model)."""
         if last_history == 0:
             return None
+        cs = self.conv_state
         cdim = self.module.conv_kernel_size
-        p = self.conv_state.shape[-1] - num_tokens
+        p = cs.shape[-1] - num_tokens
+        es = cs.element_size()
+        base = cs.data_ptr() + slot * cs.stride(0) * es
         return ext.ConvRewindJob(
-            self.conv_state[slot, 0, p - cdim].data_ptr(),
-            self.conv_state[slot, 0, 0].data_ptr(),
-            self.conv_state.shape[1],
+            base + (p - cdim) * cs.stride(2) * es,
+            base,
+            cs.shape[1],
             cdim,
-            self.conv_state.stride(1),
+            cs.stride(1),
         )
 
 
@@ -263,10 +285,13 @@ class GDNLayerState:
         computed without performing any copy. Same gating condition as rewind()'s state branch."""
         if num_tokens == 0:
             return None
+        rs = self.recurrent_state
+        es = rs.element_size()
+        base = rs.data_ptr() + slot * rs.stride(0) * es
         return ext.StateRewindJob(
-            self.recurrent_state[slot, last_history + 1 - num_tokens].data_ptr(),
-            self.recurrent_state[slot, 0].data_ptr(),
-            self.recurrent_state[slot, 0].numel(),
+            base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
+            base,
+            rs.stride(1),
         )
 
 
@@ -324,6 +349,11 @@ class GatedDeltaNet(Module):
         key_z: str | None = None,
         key_b: str | None = None,
         key_a: str | None = None,
+        key_f_a: str | None = None,
+        key_f_b: str | None = None,
+        key_g_a: str | None = None,
+        key_g_b: str | None = None,
+        gate_lower_bound: float | None = None,
         key_norm: str | None = None,
         key_o: str | None = None,
         a_log: torch.Tensor | None = None,
@@ -336,6 +366,10 @@ class GatedDeltaNet(Module):
         a_proj: Linear | None = None,
         norm: GatedRMSNorm | None = None,
         o_proj: Linear | None = None,
+        f_a_proj: Linear | None = None,
+        f_b_proj: Linear | None = None,
+        g_a_proj: Linear | None = None,
+        g_b_proj: Linear | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         select_hq_bits: int = 0,
@@ -363,13 +397,32 @@ class GatedDeltaNet(Module):
         self.fdim_ba = 2 * self.num_v_heads
         self.fdim_qkv = 2 * self.num_k_heads * self.k_head_dim + self.num_v_heads * self.v_head_dim
 
+        # KDA mode (GLM5.3/Kimi linear attention): per-k-channel decay from a low-rank forget
+        # gate (f_a/f_b + per-channel dt_bias + per-head A_log, "safe gate" when
+        # gate_lower_bound is set), a low-rank sigmoid output gate (g_a/g_b) in place of z,
+        # and in-kernel q/k l2norm. Shares the conv, projections, cache and rewind machinery
+        self.kda = key_f_a is not None
+        self.gate_lower_bound = gate_lower_bound
+        self.key_f_a = key_f_a
+        self.key_f_b = key_f_b
+        self.key_g_a = key_g_a
+        self.key_g_b = key_g_b
+
         if self.num_k_heads == 0:
             return
 
+        if self.kda:
+            assert key_f_b and key_g_a and key_g_b, \
+                "KDA mode requires key_f_a, key_f_b, key_g_a and key_g_b"
+            assert (key_b or b_proj is not None) and not key_a, \
+                "KDA mode takes key_b for beta; decay comes from the f projections"
+            assert num_k_heads == num_v_heads and k_head_dim == v_head_dim, \
+                "KDA mode requires uniform head geometry"
+
         if key_qkv or key_z:
-            assert key_qkv and key_z, \
+            assert key_qkv and (key_z or self.kda), \
                 "GatedDeltaNet split qkv/z projections require both key_qkv and key_z"
-        if key_b or key_a:
+        if (key_b or key_a) and not self.kda:
             assert key_b and key_a, \
                 "GatedDeltaNet split b/a projections require both key_b and key_a"
 
@@ -405,19 +458,22 @@ class GatedDeltaNet(Module):
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkvz",
             )
-            self.z_proj = Linear(
-                config,
-                f"{key}.{key_z}",
-                hidden_size,
-                self.v_dim,
-                qmap = qmap + ".input",
-                out_dtype = torch.float,
-                select_hq_bits = select_hq_bits,
-                qgroup = key + ".qkvz",
-            )
             self.qkvz_proj = None
             self.register_submodule(self.qkv_proj)
-            self.register_submodule(self.z_proj)
+            if key_z:
+                self.z_proj = Linear(
+                    config,
+                    f"{key}.{key_z}",
+                    hidden_size,
+                    self.v_dim,
+                    qmap = qmap + ".input",
+                    out_dtype = torch.float,
+                    select_hq_bits = select_hq_bits,
+                    qgroup = key + ".qkvz",
+                )
+                self.register_submodule(self.z_proj)
+            else:
+                self.z_proj = None
         else:
             self.qkvz_proj = None
             self.qkv_proj = None
@@ -434,6 +490,11 @@ class GatedDeltaNet(Module):
             self.ba_proj = None
             self.register_submodule(self.b_proj)
             self.register_submodule(self.a_proj)
+        elif key_b and self.kda:
+            self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.a_proj = None
+            self.ba_proj = None
+            self.register_submodule(self.b_proj)
         elif key_b:
             self.b_proj = Linear(config, f"{key}.{key_b}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
             self.a_proj = Linear(config, f"{key}.{key_a}", hidden_size, self.num_v_heads, qmap = None, out_dtype = torch.float, pad_to = 1)
@@ -444,6 +505,27 @@ class GatedDeltaNet(Module):
             self.b_proj = None
             self.a_proj = None
             self.ba_proj = None
+
+        # KDA low-rank forget-gate and output-gate projections. Kept in fp16 (qmap = None):
+        # the reference fp8 checkpoints exclude them from quantization, which is a strong
+        # sensitivity signal
+        if self.kda and f_a_proj is not None:
+            # Prebuilt (TP import)
+            self.f_a_proj = f_a_proj
+            self.f_b_proj = f_b_proj
+            self.g_a_proj = g_a_proj
+            self.g_b_proj = g_b_proj
+            for m in (self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj):
+                self.register_submodule(m)
+        elif self.kda:
+            self.f_a_proj = Linear(config, f"{key}.{key_f_a}", hidden_size, self.k_head_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.f_b_proj = Linear(config, f"{key}.{key_f_b}", self.k_head_dim, self.k_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.g_a_proj = Linear(config, f"{key}.{key_g_a}", hidden_size, self.v_head_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            self.g_b_proj = Linear(config, f"{key}.{key_g_b}", self.v_head_dim, self.v_dim, qmap = None, out_dtype = torch.float, pad_to = 1)
+            for m in (self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj):
+                self.register_submodule(m)
+        else:
+            self.f_a_proj = self.f_b_proj = self.g_a_proj = self.g_b_proj = None
 
         if o_proj:
             self.o_proj = o_proj
@@ -465,7 +547,9 @@ class GatedDeltaNet(Module):
             self.norm = norm
             self.register_submodule(self.norm)
         else:
-            self.norm = GatedRMSNorm(config, f"{key}.{key_norm}", self.rms_norm_eps, out_dtype = torch.half)
+            self.norm = GatedRMSNorm(
+                config, f"{key}.{key_norm}", self.rms_norm_eps, out_dtype = torch.half,
+                gate_activation = "sigmoid" if self.kda else "silu")
             self.register_submodule(self.norm)
 
         self.a_log = None
@@ -598,7 +682,7 @@ class GatedDeltaNet(Module):
             self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
 
         is_quantized_split = (
-            device != torch.device("cpu") and
+            _bc_gdn_enable and device != torch.device("cpu") and
             self.qkvz_proj is None and self.ba_proj is None and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
             self.z_proj is not None and self.z_proj.quant_type == "exl3" and
@@ -643,20 +727,101 @@ class GatedDeltaNet(Module):
             )
             self.bc_split = True
 
+            # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
+            # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
+            # eager path (m <= 32) uses them directly
+            self.multi_qkvz = None
+            if (
+                _qkv_slice_enable and
+                self.qkv_proj.inner.bias is None and self.z_proj.inner.bias is None and
+                self.qkv_proj.inner.K == self.z_proj.inner.K and
+                self.qkv_proj.in_features == self.z_proj.in_features
+            ):
+                try:
+                    self.multi_qkvz = SlicedMultiLinear(self.device, [self.qkv_proj, self.z_proj])
+                except (ValueError, AssertionError):
+                    self.multi_qkvz = None
+                # Unfusing policy judged on the slice width (see attn.py)
+                if self.multi_qkvz is not None and not self.config.infer_params.use_mgemm(
+                    self.multi_qkvz.K, self.multi_qkvz.width, self.multi_qkvz.mul1, device,
+                ):
+                    self.multi_qkvz = None
+            if self.multi_qkvz is not None:
+                mq = self.multi_qkvz
+                self.bc.set_qkvz_bundle(mq.ptrs_trellis, mq.ptrs_suh, mq.ptrs_svh, mq.meta, mq.K, bool(mq.mcg), bool(mq.mul1))
+                # fp32 outputs: the mgemm C argument carries the dtype and slice width only
+                self.prealloc_qkvz_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.float, "qkvzc_1")
+
+        is_quantized_kda = (
+            _bc_gdn_enable and device != torch.device("cpu") and self.kda and
+            self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
+            self.o_proj is not None and self.o_proj.quant_type == "exl3" and
+            all(p is not None and p.quant_type == "fp16" for p in
+                (self.b_proj, self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj)) and
+            self.conv1d_weight_flat is not None and
+            self.conv1d_weight_flat.dtype == torch.bfloat16 and
+            (self.conv1d_bias is None or self.conv1d_bias.dtype == torch.bfloat16) and
+            self.dt_bias is not None
+        )
+
+        if is_quantized_kda:
+            # The gate op reads dt_bias as bf16; converted models may round-trip it as fp32
+            # (exact for originally-bf16 values). Allocated here, FILLED in the deferred-fill
+            # block on the first forward: at this point dt_bias may still be an unfilled
+            # deferred tensor, and a .to() would copy garbage
+            self.dt_bias_bc = torch.empty_like(self.dt_bias, dtype = torch.bfloat16)
+            # Transposed fp16 copies of the small projections for the graph GEMVs; weights may
+            # not be materialized yet (deferred load) so only allocate here and fill on the
+            # first forward (the BC keeps references)
+            nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
+            hs = self.hidden_size
+            self.kda_b_t = torch.empty((nv, hs), dtype = torch.half, device = device)
+            self.kda_fa_t = torch.empty((hk, hs), dtype = torch.half, device = device)
+            self.kda_fb_t = torch.empty((nv * hk, hk), dtype = torch.half, device = device)
+            self.kda_ga_t = torch.empty((hv, hs), dtype = torch.half, device = device)
+            self.kda_gb_t = torch.empty((nv * hv, hv), dtype = torch.half, device = device)
+            self.ba_weight_filled = False
+
+            self.bc = ext.BC_GatedDeltaNetSplit(
+                self.qkv_proj.inner.bc,
+                self.o_proj.inner.bc,
+                self.kda_b_t,
+                self.kda_fa_t,
+                self.kda_fb_t,
+                self.kda_ga_t,
+                self.kda_gb_t,
+                self.dt_bias_bc,
+                self.a_log,
+                float(self.gate_lower_bound or 0.0),
+                self.num_k_heads,
+                nv,
+                self.k_head_dim,
+                hv,
+                self.conv1d_weight_flat,
+                self.conv1d_bias,
+                self.norm.bc,
+                self.beta_scale
+            )
+            self.bc_split = True
+
 
     @override
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
         if self.key_a_log is not None:
             self.a_log = self.config.stc.get_tensor(self.key_a_log, self.device, optional = False, allow_bf16 = True)
+            # Kimi Linear stores A_log as (1, 1, H, 1); the kernels take it as (H,)
+            self.a_log = self.a_log.reshape(-1)
             self.dt_bias = self.config.stc.get_tensor(self.key_dt_bias, self.device, optional = False, allow_bf16 = True)
         if self.key_conv1d_weight is not None:
-            self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True)
-            self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True)
+            # no_defer: load_local concatenates/flattens (copies) these immediately, which a
+            # deferred (unfilled) tensor would corrupt
+            self.conv1d_weight = self.config.stc.get_tensor(self.key_conv1d_weight, self.device, optional = True, allow_bf16 = True, no_defer = True)
+            self.conv1d_bias = self.config.stc.get_tensor(self.key_conv1d_bias, self.device, optional = True, allow_bf16 = True, no_defer = True)
             if self.conv1d_weight is None:
-                self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True)
-                self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True)
-                self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True)
+                self.conv1d_q_weight = self.config.stc.get_tensor(self.key_conv1d_q_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
+                self.conv1d_k_weight = self.config.stc.get_tensor(self.key_conv1d_k_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
+                self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
 
@@ -672,6 +837,8 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self.multi_qkvz = None
+        self.prealloc_qkvz_carrier = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -728,6 +895,69 @@ class GatedDeltaNet(Module):
         return mixed_qkv, z, b, a
 
 
+    def _bc_configure_slot_kda(self, bsz: int, seqlen: int, history: bool):
+        device = self.device
+        f = self.fdim_qkv
+        nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
+        qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
+        z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
+        b_out           = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_kb")
+        fa_out          = g_tensor_cache.get(device, (bsz, seqlen, hk), torch.float, "s_kfa")
+        fb_out          = g_tensor_cache.get(device, (bsz, seqlen, nv * hk), torch.float, "s_kfb")
+        ga_out          = g_tensor_cache.get(device, (bsz, seqlen, hv), torch.float, "s_kga")
+        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+        g               = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
+        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
+        core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
+        qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
+        o_xh   = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_o_xh")
+        self.bc.configure_slot_kda(
+            bsz, seqlen, history,
+            qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
+            core_attn_out, core_attn_out_f, qkv_xh, o_xh,
+        )
+
+    def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
+        """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
+        mq = self.multi_qkvz
+        m = bsz * seqlen
+        hidden = self.qkv_proj.in_features
+        x = x.half()
+        if x.shape[-1] < hidden:
+            x = torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))
+        x = x.contiguous().view(1, m, hidden)
+        xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
+        qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
+        z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
+        c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
+        ext.exl3_mgemm(
+            x,
+            mq.ptrs_trellis,
+            self.prealloc_qkvz_carrier.expand(mq.num_slices, m, mq.width),
+            mq.ptrs_suh,
+            xh,
+            mq.ptrs_svh,
+            None,
+            None,
+            mq.K,
+            -1,
+            mq.mcg,
+            mq.mul1,
+            -1,
+            -1,
+            0,
+            1,
+            mq.size_n_list,
+            c_ptrs,
+            mq.n_stride_list,
+            mq.had_src_list,
+            mq.num_src,
+        )
+        return qkv, z
+
+
     def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
         """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
         statics for the BC_GatedDeltaNetSplit graph slot and hand them to C++. Called at most
@@ -765,7 +995,7 @@ class GatedDeltaNet(Module):
         if self.num_k_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
@@ -783,6 +1013,8 @@ class GatedDeltaNet(Module):
             self.conv1d_v_weight = None
         if self.conv1d_weight_flat is None:
             self.conv1d_weight_flat = self.conv1d_weight.squeeze(1).contiguous()
+
+        conv_token_major = False   # set where the conv reads the projection output in place
 
         # Previous state
         rsg = params.get("recurrent_states")
@@ -802,7 +1034,15 @@ class GatedDeltaNet(Module):
             save_history = False  # no SD without prior state, for simplicity
 
         # Deferred fill of the merged b/a projection (weights are materialized by now)
-        if self.bc_split and not self.ba_weight_filled:
+        if self.bc_split and not self.ba_weight_filled and self.kda:
+            self.dt_bias_bc.copy_(self.dt_bias)
+            self.kda_b_t.copy_(self.b_proj.inner.get_weight_tensor().T)
+            self.kda_fa_t.copy_(self.f_a_proj.inner.get_weight_tensor().T)
+            self.kda_fb_t.copy_(self.f_b_proj.inner.get_weight_tensor().T)
+            self.kda_ga_t.copy_(self.g_a_proj.inner.get_weight_tensor().T)
+            self.kda_gb_t.copy_(self.g_b_proj.inner.get_weight_tensor().T)
+            self.ba_weight_filled = True
+        elif self.bc_split and not self.ba_weight_filled:
             self.ba_weight_t.copy_(torch.cat([
                 self.b_proj.inner.get_weight_tensor(),
                 self.a_proj.inner.get_weight_tensor(),
@@ -826,11 +1066,14 @@ class GatedDeltaNet(Module):
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
         ):
             if self.bc.needs_configure(bsz, seqlen, save_history):
-                self._bc_configure_slot(bsz, seqlen, save_history)
+                if self.kda:
+                    self._bc_configure_slot_kda(bsz, seqlen, save_history)
+                else:
+                    self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
-                params["backend"].all_reduce(y)
+                self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
 
         # Torch path
@@ -858,13 +1101,54 @@ class GatedDeltaNet(Module):
                 self.v_head_dim,
                 self.beta_scale
             )
+            del qkvz, ba
+        elif self.kda:
+            qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+            if _conv_token_major:
+                mixed_qkv, conv_token_major = qkv, True   # read in place by the conv
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            del qkv
+
+            # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
+            # (z stays fp32: the gated norm takes a bf16 or fp32 gate, not fp16)
+            z = self.g_b_proj.forward(self.g_a_proj.forward(x, params, out_dtype = torch.half), params) \
+                .view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+
+            beta = torch.sigmoid(self.b_proj.forward(x, params, out_dtype = _gate_dtype).float() * self.beta_scale) \
+                .to(torch.bfloat16)
+
+            # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
+            # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference)
+            f = self.f_b_proj.forward(self.f_a_proj.forward(x, params, out_dtype = torch.half), params,
+                                      out_dtype = _gate_dtype)
+            # One fp32 (rows, v_heads, k_head_dim) tensor for the whole chain: F.softplus with the
+            # threshold is the where/log1p/exp expression in one kernel, and the decay scaling is
+            # in place. The op-by-op form held five of these (2.5 GB per 16k rows on GLM-5.3)
+            gf = f.float() if f.dtype != torch.float else f.clone()
+            del f
+            gf = gf.add_(self.dt_bias.float().view(1, 1, -1)).view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
+            decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
+            if self.gate_lower_bound is not None:
+                g = torch.sigmoid(gf.mul_(decay)).mul_(self.gate_lower_bound)
+            else:
+                g = F.softplus(gf, threshold = 20.0).mul_(-decay)
+            del gf
         else:
-            qkv = self.qkv_proj.forward(x, params)
-            z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+                qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
+            else:
+                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+                z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
+            z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            if _conv_token_major and bsz * seqlen > 32:
+                mixed_qkv, conv_token_major = qkv, True   # the decode kernel wants channel-major bf16
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            del qkv
 
             beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
             g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
@@ -886,6 +1170,7 @@ class GatedDeltaNet(Module):
             conv1d_bias = self.conv1d_bias,
             history = save_history,
             params = params,
+            token_major = conv_token_major,
         )
 
         # Delta rule
@@ -904,18 +1189,21 @@ class GatedDeltaNet(Module):
             k_head_dim = self.k_head_dim,
             v_head_dim = self.v_head_dim,
             params = params,
+            channelwise_g = self.kda,
         )
+        del mixed_qkv, beta, g
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
         core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
+        del z
 
         # Output projection
         x = self.o_proj.forward(core_attn_out, params)
 
         # TP reduction
         if self.tp_reduce:
-            params["backend"].all_reduce(x)
+            self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -936,14 +1224,18 @@ class GatedDeltaNet(Module):
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         assert self.qkv_proj is not None
-        assert self.z_proj is not None
         assert self.b_proj is not None
-        assert self.a_proj is not None
-        storage = 0
-        storage += self.qkv_proj.storage_size()
-        storage += self.z_proj.storage_size()
-        storage += self.b_proj.storage_size()
-        storage += self.a_proj.storage_size()
+        # Head-split projections. KDA has no z/a projections; its low-rank gate pairs split on
+        # the expanding side (f_b/g_b) while the contracting side (f_a/g_a) is replicated
+        if self.kda:
+            split_projs = [self.qkv_proj, self.b_proj, self.f_b_proj, self.g_b_proj, self.o_proj]
+            storage_dev = self.f_a_proj.storage_size() + self.g_a_proj.storage_size()
+        else:
+            assert self.z_proj is not None
+            assert self.a_proj is not None
+            split_projs = [self.qkv_proj, self.z_proj, self.b_proj, self.a_proj, self.o_proj]
+            storage_dev = 0
+        storage = sum(p.storage_size() for p in split_projs)
         for cl in self.recurrent_layers:
             storage += cl.storage_size()
         overhead_d = 0
@@ -951,10 +1243,7 @@ class GatedDeltaNet(Module):
         overhead_s = 0
         overhead_s += 2 * self.num_k_heads * self.k_head_dim * torch.half.itemsize
         overhead_s += 2 * self.num_v_heads * self.v_head_dim * torch.half.itemsize
-        recons = max(
-            self.qkv_proj.recons_size(),
-            self.z_proj.recons_size(),
-        )
+        recons = max(p.recons_size() for p in split_projs)
         channel_width = 1
         channels_to_split = self.num_k_heads
         assert self.num_v_heads % self.num_k_heads == 0, \
@@ -970,7 +1259,7 @@ class GatedDeltaNet(Module):
             key = self.key,
             channel_width = channel_width,
             channel_unit = "K-heads",
-            storage_per_device = 0,
+            storage_per_device = storage_dev,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1005,6 +1294,12 @@ class GatedDeltaNet(Module):
                 "conv_kernel_size": self.conv_kernel_size,
                 "beta_scale": self.beta_scale,
                 "out_dtype": self.out_dtype,
+                # KDA mode is keyed on key_f_a; the projections themselves arrive prebuilt
+                "key_f_a": self.key_f_a,
+                "key_f_b": self.key_f_b,
+                "key_g_a": self.key_g_a,
+                "key_g_b": self.key_g_b,
+                "gate_lower_bound": self.gate_lower_bound,
             },
             "num_k_heads": self.num_k_heads,
             "num_v_heads": self.num_v_heads,
@@ -1020,6 +1315,10 @@ class GatedDeltaNet(Module):
                 "conv1d_bias",
                 "a_log",
                 "dt_bias",
+                "f_a_proj",
+                "f_b_proj",
+                "g_a_proj",
+                "g_b_proj",
             )},
             "device": self.device,
             "recurrent_layers": [
@@ -1056,6 +1355,14 @@ class GatedDeltaNet(Module):
             if num_k_heads else None
         b_split = (True, first * G, last * G) \
             if num_k_heads else None
+        # KDA: f_b/g_b expand a head_dim-wide latent to the per-channel k/v widths (column split
+        # by head range), f_a/g_a are replicated, and dt_bias is per k-channel, not per head
+        kda = exported["kwargs"].get("key_f_a") is not None
+        fb_split = (True, first * k_head_dim, last * k_head_dim) \
+            if num_k_heads else None
+        gb_split = (True, first * v_head_dim * G, last * v_head_dim * G) \
+            if num_k_heads else None
+        dt_split = fb_split if kda else a_split
 
         def _import(name):
             nonlocal exported, plan
@@ -1086,7 +1393,11 @@ class GatedDeltaNet(Module):
             a_proj = _import_split("a_proj", a_split),
             norm = _import("norm"),
             a_log = _import_split("a_log", a_split),
-            dt_bias = _import_split("dt_bias", a_split),
+            dt_bias = _import_split("dt_bias", dt_split),
+            f_a_proj = _import("f_a_proj") if num_k_heads else None,
+            f_b_proj = _import_split("f_b_proj", fb_split),
+            g_a_proj = _import("g_a_proj") if num_k_heads else None,
+            g_b_proj = _import_split("g_b_proj", gb_split),
         )
 
         if num_k_heads:
@@ -1101,6 +1412,7 @@ class GatedDeltaNet(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()

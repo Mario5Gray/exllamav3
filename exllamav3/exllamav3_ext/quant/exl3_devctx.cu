@@ -45,13 +45,35 @@ int DevCtx::get_cc(int device)
     return cc[device];
 }
 
+int DevCtx::get_smem_max(int device)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!smem_max[device])
+    {
+        // The driver value, unclamped: this is a device capability, and callers that only need
+        // "what may I request for an EXL3 kernel" clamp to SMEM_MAX themselves (see
+        // get_smem_request). Clamping here would have made an sm_86 device indistinguishable
+        // from a 90 KB one and dragged it onto the Turing code paths.
+        int optin = 0;
+        cuda_check(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        smem_max[device] = optin;
+    }
+    return smem_max[device];
+}
+
+int DevCtx::get_smem_request(int device)
+{
+    return MIN(get_smem_max(device), EXL3_SMEM_MAX_DEFAULT);
+}
+
 void* DevCtx::get_ws(int device)
 {
     std::lock_guard<std::mutex> lock(mtx);
     if (!ws[device])
     {
-        cudaSetDevice(device);
-        cudaMalloc(&ws[device], WORKSPACE_SIZE);
+        c10::cuda::CUDAGuard guard(device);
+        cudaError_t e = cudaMalloc(&ws[device], WORKSPACE_SIZE);
+        TORCH_CHECK(e == cudaSuccess, "exl3 workspace allocation failed on device ", device, ": ", cudaGetErrorString(e));
     }
     return ws[device];
 }
@@ -61,10 +83,12 @@ int* DevCtx::get_locks(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!locks[device])
     {
-        cudaSetDevice(device);
+        c10::cuda::CUDAGuard guard(device);
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
-        cudaMalloc(&locks[device], size);
-        cudaMemset(locks[device], 0, size);
+        cudaError_t e = cudaMalloc(&locks[device], size);
+        TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
+        e = cudaMemset(locks[device], 0, size);
+        TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer memset failed: ", cudaGetErrorString(e));
     }
     return (int*) locks[device];
 }
@@ -79,9 +103,15 @@ int g_get_num_sms(int device)
     return DevCtx::instance().get_num_sms(device);
 }
 
+int g_get_smem_max(int device)
+{
+    return DevCtx::instance().get_smem_max(device);
+}
+
 void prepare_ctx(int device)
 {
     DevCtx::instance().get_num_sms(device);
     DevCtx::instance().get_cc(device);
+    DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
 }

@@ -8,7 +8,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
-from .multilinear import MultiLinear
+from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
 from ..cache import Cache
 from ..cache.recurrent import (
@@ -18,6 +18,10 @@ from ..cache.recurrent import (
 )
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+import os
+
+# Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
+_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 
 
 class SWAExportedState:
@@ -248,10 +252,12 @@ class SlidingAttention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
         key_v: str | None = None,
+        key_fused_qkv: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
         key_sinks: str | None = None,
@@ -270,7 +276,9 @@ class SlidingAttention(Module):
         g_proj: Linear | Module | None = None,
         full_gate: bool = False,
         gate_softplus: bool = False,
+        transpose_qkv: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits",
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
@@ -281,6 +289,12 @@ class SlidingAttention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128), mirroring Attention. The window ring,
+        # the paged-attention kernels and the block tables all carry a single head dim, so V is
+        # stored at head_dim with its top head_dim - v_head_dim lanes zero-filled by the loader
+        # and trimmed back off in project_o, which keeps o_proj sized on v_head_dim.
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "SlidingAttention: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -310,6 +324,11 @@ class SlidingAttention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
         self.tp_reduce = False
@@ -323,13 +342,21 @@ class SlidingAttention(Module):
             return
 
         # Create q, k, v projections
-        fkey, frange_q, frange_k, frange_v = None, None, None, None
+        if key_fused_qkv:
+            assert not (q_proj is not None or k_proj is not None or v_proj is not None), \
+                "SlidingAttention: fused QKV tensor is not supported with pre-made projections"
+            fkey = f"{key}.{key_fused_qkv}"
+            frange_q = (0, num_q_heads * head_dim)
+            frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
+            frange_v = (frange_k[1], frange_k[1] + num_kv_heads * head_dim)
+        else:
+            fkey, frange_q, frange_k, frange_v = None, None, None, None
 
         if key_q or frange_q:
             f = 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -337,7 +364,9 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -348,7 +377,7 @@ class SlidingAttention(Module):
         if key_k or frange_k:
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -356,11 +385,13 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -368,7 +399,9 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -384,7 +417,7 @@ class SlidingAttention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -503,7 +536,8 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
-            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            # Staging buffers span the padded K, not hidden_size (see attn.py)
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.k_proj.in_features), torch.half, "kvh_1")
             self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
@@ -524,8 +558,47 @@ class SlidingAttention(Module):
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
-            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
+
+        # Sliced Q/K/V(/G) bundle: all attention projections as one launch of equal-width column
+        # slices (SlicedMultiLinear, see attn.py). Takes precedence over the pairwise bundles at
+        # decode. A gate projection must ride along (full, quantized, same K) or there is no bundle
+        self.multi_qkv = None
+        gate_ok = self.g_proj is None or (
+            self.full_gate and self.g_proj.quant_type == "exl3" and self.g_proj.inner.bias is None
+        )
+        if (
+            _qkv_slice_enable and
+            not self.config.infer_params.no_reconstruct and
+            device != torch.device("cpu") and
+            gate_ok and
+            all(p.quant_type == "exl3" and p.inner.bias is None for p in (self.q_proj, self.k_proj, self.v_proj)) and
+            all(p.inner.K == self.q_proj.inner.K for p in (self.k_proj, self.v_proj)) and
+            all(p.in_features == self.q_proj.in_features for p in (self.k_proj, self.v_proj))
+        ):
+            linears = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.g_proj is not None else [])
+            try:
+                self.multi_qkv = SlicedMultiLinear(self.device, linears)
+            except (ValueError, AssertionError):
+                self.multi_qkv = None
+            # The unfusing policy (int8 GEMV vs batched MGEMM) judges whether a matrix is wide
+            # enough to fill the GPU on its own: for the bundle that is a slice, not the widest
+            # projection, since equal-width slices are what restore utilization
+            if self.multi_qkv is not None and not self.config.infer_params.use_mgemm(
+                self.multi_qkv.K, self.multi_qkv.width, self.multi_qkv.mul1, device,
+            ):
+                self.multi_qkv = None
+        if self.multi_qkv is not None:
+            mq = self.multi_qkv
+            n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
+            self.prealloc_qkvh_1 = g_tensor_cache.get(device, (mq.num_src, 1, self.q_proj.in_features), torch.half, "qkvh_1")
+            qg_1 = g_tensor_cache.get(device, (2, 1, n_q), torch.half, "qg_1")
+            kv_1 = g_tensor_cache.get(device, (2, 1, n_kv), torch.half, "kv_1")
+            outs = [qg_1[0], kv_1[0], kv_1[1]] + ([qg_1[1]] if self.g_proj is not None else [])
+            self.prealloc_qkv_out_1 = (qg_1, kv_1)
+            self.prealloc_qkv_cptrs_1 = mq.c_ptrs(outs)
+            self.prealloc_qkv_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.half, "qkvc_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
@@ -551,6 +624,8 @@ class SlidingAttention(Module):
     def unload(self):
         super().unload()
 
+        for rl in self.recurrent_layers:
+            rl.free()
         self.bc_attn = {}
         self.rope = None
         self.sinks = None
@@ -570,6 +645,11 @@ class SlidingAttention(Module):
         self.prealloc_qg_1 = None
         self.prealloc_kvh_1 = None
         self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
         self.bt_cache = {}
 
 
@@ -593,7 +673,7 @@ class SlidingAttention(Module):
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -605,13 +685,17 @@ class SlidingAttention(Module):
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
-                params["backend"].all_reduce(x)
+                self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+
+        if self.multi_qkv is not None and bsz * q_len <= 32:
+            q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
+            return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
@@ -620,12 +704,16 @@ class SlidingAttention(Module):
             else:
                 g = None
         else:
-            x = x.view(1, bsz * q_len, dim)
+            # The fused path doesn't zero-extend the input for padded in_features: do it here (K is the
+            # padded width the mgemm kernel reads)
+            if x.shape[-1] < self.q_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.q_proj.in_features)
             if bsz * q_len == 1:
                 qgh = self.prealloc_qgh_1
                 qg = self.prealloc_qg_1
             else:
-                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qgh = torch.empty((2, bsz * q_len, self.q_proj.in_features), dtype = torch.half, device = x.device)
                 qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -652,12 +740,14 @@ class SlidingAttention(Module):
             v = self.v_proj.forward(x, params)
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            if x.shape[-1] < self.k_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.k_proj.in_features)
             if bsz * q_len == 1:
                 kvh = self.prealloc_kvh_1
                 kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
                 kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -679,6 +769,10 @@ class SlidingAttention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
+        return self.finish_qkv(q, k, v, g, bsz, q_len, params)
+
+
+    def finish_qkv(self, q, k, v, g, bsz: int, q_len: int, params: dict) -> tuple:
         q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
@@ -689,8 +783,61 @@ class SlidingAttention(Module):
         return q, k, v, g
 
 
+    def project_qkv_sliced(self, x: torch.Tensor, bsz: int, q_len: int) -> tuple:
+        """All attention projections as one sliced mgemm (see SlicedMultiLinear); m <= 32 rows"""
+        mq = self.multi_qkv
+        m = bsz * q_len
+        n_q, n_kv = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
+        # The fused path doesn't zero-extend the input for padded in_features
+        if x.shape[-1] < self.q_proj.in_features:
+            x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+        x = x.view(1, m, self.q_proj.in_features)
+        if m == 1:
+            qkvh = self.prealloc_qkvh_1
+            qg, kv = self.prealloc_qkv_out_1
+            c_ptrs = self.prealloc_qkv_cptrs_1
+        else:
+            qkvh = torch.empty((mq.num_src, m, self.q_proj.in_features), dtype = torch.half, device = x.device)
+            qg = torch.empty((2, m, n_q), dtype = torch.half, device = x.device)
+            kv = torch.empty((2, m, n_kv), dtype = torch.half, device = x.device)
+            c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.g_proj is not None else []))
+        ext.exl3_mgemm(
+            x,
+            mq.ptrs_trellis,
+            self.prealloc_qkv_carrier.expand(mq.num_slices, m, mq.width),
+            mq.ptrs_suh,
+            qkvh,
+            mq.ptrs_svh,
+            None,
+            None,
+            mq.K,
+            -1,
+            mq.mcg,
+            mq.mul1,
+            -1,
+            -1,
+            0,
+            1,
+            mq.size_n_list,
+            c_ptrs,
+            mq.n_stride_list,
+            mq.had_src_list,
+            mq.num_src,
+        )
+        q = qg[0].view(bsz, q_len, n_q)
+        g = qg[1].view(bsz, q_len, n_q) if self.g_proj is not None else None
+        k = kv[0].view(bsz, q_len, n_kv)
+        v = kv[1].view(bsz, q_len, n_kv)
+        return q, k, v, g
+
+
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if self.v_head_dim != self.head_dim:
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
+        else:
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -995,7 +1142,9 @@ class SlidingAttention(Module):
         )
         channel_width = 1
         channels_to_split = self.num_kv_heads
-        while channel_width * self.head_dim < 128:
+        # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+        # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+        while (channel_width * self.head_dim) % 128 != 0:
             assert channels_to_split % 2 == 0, \
                 "Model's K/V heads cannot divide into 128-channel tensors"
             channel_width *= 2
@@ -1033,6 +1182,7 @@ class SlidingAttention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
@@ -1040,6 +1190,7 @@ class SlidingAttention(Module):
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
                 "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
             },
             "num_kv_heads": self.num_kv_heads,
             "n_gqa": self.num_q_heads // self.num_kv_heads,
@@ -1078,7 +1229,8 @@ class SlidingAttention(Module):
             if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
-        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+        v_head_dim = exported["kwargs"].get("v_head_dim") or head_dim
+        o_split = (False, first * v_head_dim * n_gqa, last * v_head_dim * n_gqa) \
             if num_kv_heads else None
         # Full gate spans head_dim channels per q head, headwise gate is one channel per q head
         if full_gate:
@@ -1133,6 +1285,7 @@ class SlidingAttention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()

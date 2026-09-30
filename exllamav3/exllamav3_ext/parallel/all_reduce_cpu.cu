@@ -32,8 +32,10 @@ void push_reduce_job
 )
 {
     atomic_ref<uint32_t> tail_(&ctx->reduce_jobs_tail);
+    atomic_ref<uint32_t> head_(&ctx->reduce_jobs_head);
     uint32_t tail = tail_.load_acquire();
     uint32_t next = (tail + 1) % MAX_REDUCE_JOBS;
+    TORCH_CHECK(next != head_.load_acquire(), "push_reduce_job: CPU reduce job queue is full");
     ctx->reduce_jobs[tail] = ReduceJob{ data_size, device_mask, wire_dtype };
     tail_.store_release(next);
 }
@@ -107,7 +109,9 @@ void run_cpu_reduce_jobs
                 break;
             if (++spins < 65536)
             {
-                #ifdef __linux__
+                #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
+                    asm volatile("yield" ::: "memory");
+                #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else
                     _mm_pause();

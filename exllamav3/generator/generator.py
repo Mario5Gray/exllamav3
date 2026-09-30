@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -6,8 +7,10 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+
+logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
-from .pagetable import PageTable
+from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
@@ -43,6 +46,7 @@ class Generator:
         dynamic_draft_tokens: bool = False,
         draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
+        ngram_corpus: str | None = None,
         **kwargs
     ):
         """
@@ -84,9 +88,12 @@ class Generator:
         :param ngram_match_min:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
 
+        :param ngram_corpus:
+            Optional frozen SAM file shared by n-gram jobs; requires ngram_match_min > 0.
+
         :param dynamic_draft_tokens:
-            Adapt the per-round draft length to the workload. The draft is cut using drafter confidence
-            (argmax logit), calibrated online against observed acceptance rates (see draft_confidence). A
+            Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
+            confidence score, calibrated online against observed acceptance rates (see draft_confidence). A
             DFlash drafter still runs at its fixed diffusion block size and only the verified window shrinks;
             AR and MTP drafters stop the drafting loop itself early, saving one drafter forward per pruned
             position. The acceptance behavior of the surviving positions is unchanged. Has no effect on n-gram
@@ -94,7 +101,7 @@ class Generator:
 
         :param draft_confidence:
             Used with dynamic_draft_tokens and a draft model: target acceptance probability for drafted
-            positions, evaluated against an online mapping from drafter confidence (argmax logit) to observed
+            positions, evaluated against an online mapping from drafter confidence scores to observed
             acceptance rates. Scale-free and portable across model pairs. For DFlash (block produced at fixed
             cost) the block is cut at the first position whose estimated conditional acceptance drops below
             the target. For AR and MTP drafters (one forward per position, and a position only pays off if
@@ -140,7 +147,11 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+        self.cache_owner_serial = cache.owner_serial
         self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
+        self._cache_stats_memo = (None, None)
 
         # Draft model
         self.draft_model = draft_model
@@ -158,11 +169,22 @@ class Generator:
                 self.num_draft_tokens = num_draft_tokens
             else:
                 self.num_draft_tokens = draft_model.caps.get("default_draft_size", 4)
+            depths = draft_model.caps.get("mtp_depths")
+            if depths is not None and self.num_draft_tokens > depths:
+                print(f" !! Warning: the MTP head has {depths} depth-specialized layers; draft positions past "
+                      f"{depths} reuse the last one, with decreasing acceptance (num_draft_tokens = "
+                      f"{self.num_draft_tokens})")
         elif ngram_match_min:
             self.num_draft_tokens = num_draft_tokens if num_draft_tokens is not None else 4
         else:
             self.num_draft_tokens = 0
 
+        self.ngram_corpus = None
+        if ngram_corpus is not None:
+            if ngram_match_min <= 0:
+                raise ValueError("ngram_corpus requires ngram_match_min > 0")
+            from .ngram import NgramCorpus
+            self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
@@ -185,17 +207,19 @@ class Generator:
         self.sample_pinned = None
         self.staging_buffers = {}
 
-        # Buffers
+        # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
+        # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
+        # into draft_ids_pinned
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
 
         # CPU page cache tier
@@ -220,6 +244,8 @@ class Generator:
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
             self.recurrent_cache.pagetable = self.pagetable
+            # The new page table owns every page, so every state slot is ours too
+            cache.reset_states()
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
@@ -227,7 +253,7 @@ class Generator:
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval_pp % PAGE_SIZE == 0, \
             "checkpoint interval must be a multiple of the page size (256)"
         def ceil_span(a, b):
             return (a + b - 1) // b * b
@@ -260,6 +286,104 @@ class Generator:
 
     def num_pending_jobs(self):
         return len(self.pending_jobs)
+
+    def get_cache_stats(self) -> dict:
+        """
+        Snapshot of cache occupancy and prompt-cache efficiency, intended for status displays.
+
+        Returns a dict with:
+            page_size: tokens per page
+            max_tokens: total cache capacity, in tokens
+            used_tokens: tokens in pages referenced by active jobs
+            cached_tokens: tokens in complete pages that a later or concurrent job could actually reuse: every
+                page on an unbroken chain down to a root, whether or not an active job currently references it.
+                Complete pages whose ancestors were evicted (orphans) don't count, since a prefix match walks
+                the chain from the root
+            free_tokens: tokens in unreferenced pages holding no reusable content
+            tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
+                same chain rule; 0 without a tier
+            tier_max_tokens: capacity of the system-memory tier, 0 without one
+            alloc_pages: cumulative pages claimed by started jobs
+            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
+            alloc_tier_pages: of those, pages restored from the system-memory tier
+            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
+            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
+                tier, or None before any job has started
+            active_jobs, pending_jobs: current job counts
+
+        The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
+        cheap.
+        """
+        pt = self.pagetable
+        tier = pt.cpu_tier
+
+        # The chain walk is linear in the number of pages, which can be large with a big system-memory
+        # tier, so it only reruns when something that can change the outcome has moved
+        signature = (
+            len(pt.referenced_pages),
+            len(pt.unreferenced_pages),
+            sum(1 for h in pt.referenced_pages if is_content_hash(h)),
+            pt.metrics["alloc_pages"],
+            pt.metrics["evictions"],
+            pt.last_defrag_serial,
+            len(tier) if tier is not None else 0,
+            (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+        )
+        memo_signature, memo = self._cache_stats_memo
+        if signature == memo_signature:
+            return {**memo, "active_jobs": len(self.active_jobs), "pending_jobs": len(self.pending_jobs)}
+
+        # prev-hash links of every complete page, per tier
+        gpu_links = {}
+        for pages in (pt.referenced_pages, pt.unreferenced_pages):
+            for h, page in pages.items():
+                if is_content_hash(h):
+                    gpu_links[h] = page.prev_hash
+        tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+
+        # A page is reusable when its whole chain is present in either tier
+        resumable = {}
+        def is_resumable(h):
+            chain = []
+            while h is not None and h not in resumable:
+                chain.append(h)
+                if h in gpu_links:
+                    h = gpu_links[h]
+                elif h in tier_links:
+                    h = tier_links[h]
+                else:
+                    resumable[h] = False
+                    break
+            result = True if h is None else resumable[h]
+            for c in chain:
+                resumable[c] = result
+            return result
+
+        cached = sum(1 for h in gpu_links if is_resumable(h))
+        tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        used = len(pt.referenced_pages)
+        free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
+        alloc = pt.metrics["alloc_pages"]
+        alloc_cached = pt.metrics["alloc_cached_pages"]
+        alloc_tier = pt.metrics["alloc_tier_pages"]
+        stats = {
+            "page_size": PAGE_SIZE,
+            "max_tokens": pt.max_pages * PAGE_SIZE,
+            "used_tokens": used * PAGE_SIZE,
+            "cached_tokens": cached * PAGE_SIZE,
+            "free_tokens": free * PAGE_SIZE,
+            "tier_cached_tokens": tier_cached * PAGE_SIZE,
+            "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "alloc_pages": alloc,
+            "alloc_cached_pages": alloc_cached,
+            "alloc_tier_pages": alloc_tier,
+            "hit_rate": alloc_cached / alloc if alloc else None,
+            "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "active_jobs": len(self.active_jobs),
+            "pending_jobs": len(self.pending_jobs),
+        }
+        self._cache_stats_memo = (signature, stats)
+        return stats
 
 
     def clear_queue(self):
@@ -398,6 +522,16 @@ class Generator:
 
         assert self.cache.initialized, \
             "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        owner_serial = getattr(self.cache, "owner_serial", None)
+        if owner_serial is not None and owner_serial != getattr(self, "cache_owner_serial", owner_serial):
+            # Superseded: drop every job without touching the cache (the new owner may already have
+            # reused these pages and state slots) and refuse to run
+            self.pending_jobs.clear()
+            self.active_jobs.clear()
+            raise RuntimeError(
+                "This Generator no longer owns its Cache: a newer Generator was created over the same "
+                "Cache. Close or discard the old Generator before creating a new one."
+            )
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
@@ -405,8 +539,11 @@ class Generator:
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
-        for job in self.active_jobs:
-            job.prefill(results)
+        for job in list(self.active_jobs):
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -441,6 +578,7 @@ class Generator:
         return results
 
 
+    @torch.inference_mode()
     def on_queue_drained(self):
         """
         Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
@@ -493,8 +631,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -589,8 +731,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -634,6 +780,7 @@ class Generator:
                 "block_table": block_index,
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
+                "draft_step": idx,   # heads specialized per depth pick their head from this
             }
             if cal is not None:
                 params["export_draft_conf"] = True
@@ -689,8 +836,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -1218,6 +1369,36 @@ class Generator:
             self.on_queue_drained()
 
 
+    def reap_failed_job(self, job, error, results: list):
+        """
+        Contain a per-job failure so the generator stays usable for other jobs: release the
+        failed job's pages and recurrent state, drop it from the active set, and append an
+        error result carrying the standard serial/stage/eos fields. The async wrapper
+        delivers the raw exception to that job's consumer only (AsyncJob.__aiter__ re-raises
+        queued exceptions) and the sync generate() API raises it, instead of the failure
+        escaping to _run_iteration, which latches AsyncGenerator.error permanently and kills
+        the iteration task for every job.
+        """
+        try:
+            job.deallocate_pages()
+        except Exception:
+            logger.error(
+                "reap_failed_job: deallocate_pages() raised while cleaning up failed "
+                "job %s; pages or recurrent state may be stranded",
+                job,
+                exc_info = True,
+            )
+        if job in self.active_jobs:
+            self.active_jobs.remove(job)
+        results.append({
+            "job": job,
+            "serial": job.serial_number,
+            "stage": "error",
+            "eos": True,
+            "error": error,
+        })
+
+
     def iterate_start_jobs(self, results: list):
         """
         Move pending jobs into the active set when batch and cache capacity allow.
@@ -1260,7 +1441,11 @@ class Generator:
                 job.activate()
 
                 # Allocate pages for job
-                job.allocate_pages()
+                try:
+                    job.allocate_pages()
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+                    continue
                 current_max_batch += len(job.sequences)
 
                 r = {
@@ -1445,6 +1630,12 @@ class Generator:
 
             for r in results:
                 idx = order[r["serial"]]
+                if r["stage"] == "error":
+                    # A per-job failure was contained by reap_failed_job; surface the
+                    # original exception to this caller rather than returning a silently
+                    # truncated completion. Jobs from the same batch that are still in
+                    # flight are left to the generator's normal queue handling.
+                    raise r["error"]
                 if r["stage"] == "streaming":
                     text = r.get("text", "")
                     completions[idx] += text

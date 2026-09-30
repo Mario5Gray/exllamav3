@@ -181,7 +181,7 @@ class LinearFP16:
     def tp_import_split_n(local_context, exported, plan, splits, dbg = False):
         consumer = local_context["consumer"]
         device = local_context["device"]
-        id_w = exported["suh"]
+        id_w = exported["weight"]
         id_b = exported["bias"]
 
         w_ = []
@@ -257,4 +257,4 @@ class LinearFP16_torch:
         return self.nn_linear.bias.data if self.nn_linear.bias is not None else None
 
     def set_weight(self, w):
-        self.nn_linear.weight = nn.Parameter(w.T.half())
+        self.nn_linear.weight = nn.Parameter(w.T.half(), requires_grad = False)

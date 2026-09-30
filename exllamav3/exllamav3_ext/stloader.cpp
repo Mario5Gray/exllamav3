@@ -239,7 +239,8 @@ static void pool_worker_main(int thread_idx)
 
             if (job0.device_id != cur_device)
             {
-                cudaSetDevice(job0.device_id);
+                cr = cudaSetDevice(job0.device_id);
+                if (cr != cudaSuccess) { batch_fail(std::string("stloader: cudaSetDevice failed: ") + cudaGetErrorString(cr)); break; }
                 cur_device = job0.device_id;
             }
 
@@ -307,7 +308,8 @@ static void pool_worker_main(int thread_idx)
         // Drain this worker's outstanding copies and conversions before reporting done
         for (auto& p : streams)
         {
-            cudaSetDevice(p.first);
+            cr = cudaSetDevice(p.first);
+            if (cr != cudaSuccess) { batch_fail(std::string("stloader: cudaSetDevice failed: ") + cudaGetErrorString(cr)); continue; }
             cr = cudaStreamSynchronize(p.second);
             if (cr != cudaSuccess)
                 batch_fail(std::string("stloader: stream sync failed: ") + cudaGetErrorString(cr));
@@ -531,11 +533,25 @@ void stloader_read
     TORCH_CHECK(!error.is_failed(), error.msg);
 }
 
+// One stream per worker thread, since the workers seek and fread concurrently. On Linux the
+// reads are positional (pread on the descriptor, no stream state touched), so a single open
+// stream serves every worker and the vector repeats it: a checkpoint sharded into hundreds of
+// files would otherwise exhaust the default descriptor limit through the per-thread copies
 std::vector<uintptr_t> stloader_open_file(const char* filename)
 {
     std::vector<uintptr_t> handles;
+    #ifdef __linux__
+        const int streams = 1;
+    #else
+        const int streams = STLOADER_THREADS;
+    #endif
     for (int i = 0; i < STLOADER_THREADS; ++i)
     {
+        if (i >= streams)
+        {
+            handles.push_back(handles[0]);
+            continue;
+        }
         FILE* file = fopen(filename, "rb");
         if (!file)
         {
@@ -554,6 +570,7 @@ void stloader_close_file(std::vector<uintptr_t> handles)
 {
     for (size_t i = 0; i < handles.size(); ++i)
     {
+        if (i > 0 && handles[i] == handles[0]) continue;   // shared stream, closed once
         FILE* file = reinterpret_cast<FILE*>(handles[i]);
         fclose(file);
     }

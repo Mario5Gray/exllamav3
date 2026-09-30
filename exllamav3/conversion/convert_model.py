@@ -5,7 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
-from ..modules.quant.exl3_lib.quantize import auto_split
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -14,7 +14,7 @@ from ..util.tensor import save_tensor_image
 from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration, get_file_calibration
 from .compile import compile_model, dsize
-from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy
+from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_strategy, HALF_RATES
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
@@ -28,6 +28,44 @@ col_red = "\u001b[31;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
+
+def monkeypatch_triton_autotuner_thread_safety():
+    """
+    Triton's Autotuner.run() stores the call's arguments as `self.nargs` on the shared
+    kernel object and nulls the attribute on exit.
+
+    capture_module_parallel / advance_state_parallel run one worker thread per device
+    through the same JIT kernels, so a thread finishing run() while another is still inside
+    the seconds-long benchmark loop poisons {**self.nargs, ...}
+
+    Every use of nargs is confined to the calling thread's run() frame, so rebinding the
+    attribute to thread-local storage removes the race with no behavioral change
+    single-threaded. A data descriptor on the class also overrides pre-existing instance
+    attributes, so the patch is safe to apply at any point.
+    """
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+    if getattr(Autotuner, "_exl3_tls_nargs", False):
+        return
+
+    def _get_nargs(self):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        return getattr(tls, "value", None) if tls is not None else None
+
+    def _set_nargs(self, value):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        if tls is None:
+            tls = self.__dict__.setdefault("_exl3_nargs_tls", threading.local())
+        tls.value = value
+
+    Autotuner.nargs = property(_get_nargs, _set_nargs)
+    Autotuner._exl3_tls_nargs = True
+
+monkeypatch_triton_autotuner_thread_safety()
+
+
 parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
 parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
@@ -35,10 +73,12 @@ parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Outpu
 parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
 parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
 parser.add_argument("-rcp", "--recipe", type = str, default = None, help = "Per-tensor bitrate recipe (YAML from sc_optimize.py), used in place of the budgeted allocation from --bits / --head_bits.")
-parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
-parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
+parser.add_argument("-hb", "--head_bits", type = float, default = None, help = "Bits per weight, output (head) layer: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 6")
+parser.add_argument("-mb", "--mtp_bits", type = float, default = None, help = "Bits per weight, MTP layers: 1-8, 1.5/2.5/3.5 (mul1 codebook), or 16 to store unquantized, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
+parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -50,6 +90,8 @@ parser.add_argument("-d", "--devices", type = str, default = "0", help = "List o
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
 parser.add_argument("-cb", "--codebook", type = str, default = "mul1", help = "Codebook: mul1 (default), mcg or 3inst")
+parser.add_argument("-hess", "--hessians", type = str, default = None, help = "Directory of precomputed per-tensor Hessians (<key>.safetensors with hin (in, in) and/or hout (out, out), square or packed upper triangle, e.g. YAQA-style Kronecker factors from a separate gradient pass). Skips the calibration forward passes; tensors with hout use two-sided LDLQ")
+parser.add_argument("-hreg", "--hessians_reg", type = float, default = None, help = "Diagonal regularization of the output-side Hessian, relative to its mean diagonal (default: same as input side, 0.025). Larger values blend toward plain one-sided LDLQ")
 parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "Deprecated (no-op): parallel mode is now the default; layers with fewer tensors than devices fall back to tile splitting")
 parser.add_argument("--max_module", type = int, help = "End quantization after this many modules, includes embedding and norm layers (for debug purposes)", default = None)
 
@@ -142,6 +184,8 @@ def prepare(args) -> (dict, dict, bool, str):
         return None, None, False, "--bits must be between 1 and 8"
     if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
         return None, None, False, "--head_bits must be between 1 and 8, or 16"
+    if args.mtp_bits is not None and (args.mtp_bits > 8 or args.mtp_bits < 1) and args.mtp_bits != 16:
+        return None, None, False, "--mtp_bits must be between 1 and 8, or 16"
     if not args.resume and args.bits is None and not args.recipe:
         return None, None, False, "Specify either --bits or --recipe"
 
@@ -160,10 +204,13 @@ def prepare(args) -> (dict, dict, bool, str):
         recipe_tensors = recipe.get("tensors") if isinstance(recipe, dict) else None
         if not isinstance(recipe_tensors, dict) or not recipe_tensors:
             return None, None, False, "Recipe must contain a non-empty 'tensors' mapping"
-        bad = [k for k, v in recipe_tensors.items()
-               if not isinstance(v, int) or not (1 <= v <= 8 or v == 16)]
+        # Integer bitrates 1-8 (or 16 = unquantized), plus the half-integer trellis rates (mul1 codebook)
+        def ok(v):
+            if isinstance(v, bool) or not isinstance(v, (int, float)): return False
+            return (float(v).is_integer() and (1 <= v <= 8 or v == 16)) or float(v) in HALF_RATES
+        bad = [k for k, v in recipe_tensors.items() if not ok(v)]
         if bad:
-            return None, None, False, f"Recipe bitrates must be integers 1-8 or 16, bad keys e.g.: {bad[:5]}"
+            return None, None, False, f"Recipe bitrates must be integers 1-8, 16, or one of {HALF_RATES}; bad keys e.g.: {bad[:5]}"
         recipe_bits = recipe.get("achieved_bpw") or recipe.get("target_bpw")
         if args.bits is None and recipe_bits is None:
             return None, None, False, "Recipe has no target_bpw/achieved_bpw; pass --bits for reporting"
@@ -187,19 +234,24 @@ def prepare(args) -> (dict, dict, bool, str):
             else:
                 raise ValueError(f" ## Missing required argument: {arg}")
         if arg in args and vars(args)[arg] is not None:
-            if arg in in_args and vars(args)[arg] and in_args[arg] != vars(args)[arg]:
+            new = vars(args)[arg]
+            if arg in in_args and in_args[arg] != new:
+                if not new:
+                    # An unset store_true flag (or a zero default) can't be told from "unspecified":
+                    # the resumed job's saved value stands (e.g. --hq stays on when resuming without it)
+                    return
                 if can_override:
                     print(
                         f" !! Warning: Overriding {arg} from existing job, was: {in_args[arg]}, "
-                        f"new value: {vars(args)[arg]}"
+                        f"new value: {new}"
                     )
                 else:
                     raise ValueError(
                         f" ## Error: Resuming job with {arg} = {in_args[arg]}, "
-                        f"cannot override with new value of {vars(args)[arg]}. "
+                        f"cannot override with new value of {new}. "
                         f"Please start a new job to change this value."
                     )
-            in_args[arg] = vars(args)[arg]
+            in_args[arg] = new
 
     for arg_, can_override, default in [
         ("in_dir", True, None),
@@ -211,6 +263,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
         ("hq", False, False),
+        ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
+        ("ngram_file", False, ""),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -219,8 +273,21 @@ def prepare(args) -> (dict, dict, bool, str):
         ("devices", True, None),
         ("device_ratios", True, None),
         ("codebook", True, "mul1"),
+        ("hessians", False, ""),
+        ("hessians_reg", False, 0.025),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
+
+    # Bitrates outside the main budget must be supported rates; the half-integer ones need the mul1 codebook
+    half_ok = in_args["codebook"] == "mul1"
+    for arg_ in ("head_bits", "mtp_bits"):
+        v = in_args[arg_]
+        if v == 16 or (float(v).is_integer() and 1 <= v <= 8):
+            in_args[arg_] = int(v)
+        elif not (half_ok and v in HALF_RATES):
+            return None, None, False, f"--{arg_} must be an integer 1-8, 16, or one of {HALF_RATES} with the mul1 codebook, got {v}"
+    if recipe_tensors is not None and not half_ok and any(v in HALF_RATES for v in recipe_tensors.values()):
+        return None, None, False, f"Recipe uses half-integer bitrates, which need the mul1 codebook"
 
     # Recipe strategy travels with the job; a stored map from a resumed job wins over the file
     if recipe_tensors is not None and "recipe_strategy" not in in_args:
@@ -312,7 +379,10 @@ def get_base_model(args):
     else:
         tokenizer = None
     if hasattr(config, "rope_settings"):
-        config.rope_settings.print()
+        if config.rope_settings:
+            config.rope_settings.print()
+        else:
+            print(f" -- No RoPE settings")
     return config, model, mtp_model, vision_model, tokenizer, use_reference_state
 
 
@@ -345,6 +415,44 @@ def get_state_error(x, ref):
      return err.item(), cos, sq
 
 
+def unpack_sym(t, n):
+    """
+    Symmetric (n, n) matrix from its packed upper triangle (row-major, as written by util/yaqa_hessians.py). Full
+    matrices pass through
+    """
+    if t.dim() == 2:
+        return t.float()
+    assert t.dim() == 1 and t.numel() == n * (n + 1) // 2, "packed Hessian size"
+    out = torch.zeros((n, n), dtype = torch.float)
+    out[torch.ones((n, n), dtype = torch.bool).triu_()] = t.float()
+    out += out.triu(1).T
+    return out
+
+
+def get_H_data(args, linear, capture_H, state):
+    """
+    Hessians for one Linear, as (H_data, H_out). H_data: captured online (calibrated conversion), or built from the
+    hin (in, in) of the tensor's --hessians file, or the uncalibrated placeholder. H_out: the file's hout (out, out)
+    if present, enabling two-sided LDLQ; a --hessians export with hout only keeps the online input-side capture
+    """
+    hin = hout = None
+    path = os.path.join(args["hessians"], linear.key + ".safetensors") if args.get("hessians") else None
+    if path and os.path.exists(path):
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            hin = unpack_sym(f.get_tensor("hin"), linear.in_features) if "hin" in f.keys() and not state else None
+            hout = unpack_sym(f.get_tensor("hout"), linear.out_features) if "hout" in f.keys() else None
+        assert hin is None or hin.shape == (linear.in_features, linear.in_features), f"{linear.key}: hin shape"
+        assert hout is None or hout.shape == (linear.out_features, linear.out_features), f"{linear.key}: hout shape"
+    if state:
+        return capture_H[linear.qmap], hout
+    hd = linear.init_H_data(False)
+    if hin is not None:
+        hd.update({"H": hin, "H_swap_device": linear.device, "count": 1})
+    elif path:
+        print(f" !! No precomputed Hessian for {linear.key}, quantizing uncalibrated")
+    return hd, hout
+
+
 def make_quant_args(args, idx, K, devices, device_ratios = None):
     quant_args = {
         "seed": idx,
@@ -354,6 +462,8 @@ def make_quant_args(args, idx, K, devices, device_ratios = None):
         "apply_out_scales": args["apply_out_scales"],
         "debug_dir": os.path.join(args["work_dir"], "debug"),
     }
+    if args.get("hessians_reg") is not None:
+        quant_args["sigma_reg_out"] = args["hessians_reg"]
     if args["codebook"] == "mcg":
         quant_args.update({"mcg": True})
     elif args["codebook"] == "mul1":
@@ -450,7 +560,8 @@ def _tile_split_devices(numel, devices, device_ratios):
 
 def quantize_linears_single(args, linears, config, strategy, idx, devices, device_ratios, capture_H, state):
 
-    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"]
+    # Batched group quantization has no two-sided LDLQ: per-tensor path when precomputed Hessians are in play
+    allow_grouping = state is not None and not args["image_dump"] and not args["verbose"] and not args.get("hessians")
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
     for group in groups:
@@ -495,8 +606,9 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             with Timer() as t:
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                     if args["image_dump"] else None
+                H_data_, quant_args["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    H_data_,
                     quant_args = quant_args,
                     progress_str = f" -- <step>: {linear.key}",
                     verbose = args["verbose"],
@@ -511,7 +623,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
     global curr_progress, max_progress
 
-    allow_grouping = state is not None and not args["verbose"]
+    allow_grouping = state is not None and not args["verbose"] and not args.get("hessians")
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
     # Split workload by group
@@ -535,8 +647,18 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         curr_progress = 0
         max_progress = len(linears)
 
-    # Worker thread
+    # Worker thread. An uncaught exception in a worker must abort the whole job: a thread that
+    # dies mid-module would otherwise leave its linears unquantized while the job carries on,
+    # compiling a broken model at the end with only a warning in the scrollback
+    errors = []
+
     def work_thread(device_idx, dev_groups):
+        try:
+            work_thread_(device_idx, dev_groups)
+        except BaseException as e:
+            errors.append(e)
+
+    def work_thread_(device_idx, dev_groups):
         global curr_progress
 
         with torch.inference_mode():
@@ -562,8 +684,9 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 linear = group[0]
                 quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
 
+                H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    H_data_,
                     quant_args = quant_args_local,
                     verbose = args["verbose"],
                     save_reg = False,
@@ -593,7 +716,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
     try:
         with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
-            while any(t.is_alive() for t in threads):
+            while any(t.is_alive() for t in threads) and not errors:
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt as e:
@@ -603,6 +726,12 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             pthread_kill(t.ident, SIGKILL)
         print("Aborted.")
         sys.exit()
+
+    if errors:
+        # Abort immediately (the other workers' remaining groups are wasted work); the traceback
+        # of the failing worker is what the user needs to see
+        print(f" !! Quantization worker failed, aborting job")
+        raise errors[0]
 
     for t in threads:
         t.join(timeout = 0.1)
@@ -994,6 +1123,22 @@ def main(args, job_state):
 
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
+    if args.get("hessians"):
+        # Precomputed Hessians with an input-side factor replace the online capture: no calibration state, no forward
+        # passes. An export with output-side factors only adds two-sided LDLQ to the normal calibrated conversion
+        probe = next((f for f in sorted(os.listdir(args["hessians"])) if f.endswith(".safetensors") and "layers." in f), None)
+        assert probe, f"No per-tensor Hessian files in {args['hessians']}"
+        with safe_open(os.path.join(args["hessians"], probe), framework = "pt", device = "cpu") as f:
+            ext_hin = "hin" in f.keys()
+        print(f" -- Using precomputed Hessians: {args['hessians']}" + ("" if ext_hin else " (output side only, input side captured online)"))
+        if ext_hin:
+            use_reference_state = False
+
+    # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
+    # into the output directory up front, so the calibration forward pass runs on the quantized
+    # table; resumable and skipped when already complete
+    from .ngram import prepare_ngram_table_for_conversion
+    prepare_ngram_table_for_conversion(args, config, model)
 
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
@@ -1044,6 +1189,7 @@ def main(args, job_state):
         strategy, final_bpw = create_q_strategy(
             model, mtp_model, config, args["bits"], args["head_bits"], args["mtp_bits"], hq,
             vision_model = vision_model, vision_bpw = args.get("vision_bits", 16),
+            half_steps = args["codebook"] == "mul1",   # 1.5 / 2.5 / 3.5 bpw exist for the mul1 codebook only
         )
     args["final_bits"] = round(final_bpw, 2)
     print(" -- Quantization strategy, summary:")
@@ -1061,6 +1207,9 @@ def main(args, job_state):
 
     # Iterate over modules
     for idx, module in enumerate(model.modules):
+
+        get_temp_buffers.cache_clear()
+        free_mem()
 
         start_module_time = time.time()
         if idx == model.first_block_idx:
@@ -1097,7 +1246,8 @@ def main(args, job_state):
             try:
                 module.load(
                     torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-                    load_slice = current_slice if slicing else None
+                    load_slice = current_slice if slicing else None,
+                    keep_source_weights = True
                 )
             finally:
                 if defer:
@@ -1217,7 +1367,7 @@ def main(args, job_state):
             # (single large tensors, e.g. lm_head)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state)
             else:
@@ -1246,7 +1396,8 @@ def main(args, job_state):
         config.stc.set_new_tensors(q_tensors)
         module.load(
             torch.device("cpu") if module.caps.get("prefer_cpu") else device,
-            source = q_tensors
+            source = q_tensors,
+            keep_source_weights = True
         )
         advance_replicas = None
         if state is not None and parallel_calib and not module.caps.get("prefer_cpu"):
@@ -1357,6 +1508,8 @@ def main(args, job_state):
 
         for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
+            get_temp_buffers.cache_clear()   # see main loop
+            free_mem()
             start_module_time = time.time()
 
             q_tensors = {}
@@ -1365,7 +1518,8 @@ def main(args, job_state):
             if defer:
                 module.config.stc.begin_deferred_load()
             try:
-                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
+                module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                            keep_source_weights = True)
             finally:
                 if defer:
                     module.config.stc.end_deferred_load()
@@ -1390,7 +1544,7 @@ def main(args, job_state):
             # Quantize (same dispatch as the main loop)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), None, None)
             else:
