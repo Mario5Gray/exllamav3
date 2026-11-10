@@ -6,10 +6,11 @@ import weakref
 from ..cache import Cache
 from ..model.config import no_default
 from ..model.model import Model
-from ..modules import RMSNorm, Attention, GatedMLP
+from ..modules import RMSNorm, Attention, SlidingAttention, SWAState, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.arch_specific.dflash2 import DFlash2Block, DFlash2DynConv, DFlash2Selector
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from .dflash import DFlashConfig, dflash_update_kv_from_target
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
@@ -87,9 +88,11 @@ class DFlash2Model(Model):
     def __init__(
         self,
         config: DFlash2Config,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.input_layer = DFlashInputLayer(
             config = config,
@@ -111,7 +114,10 @@ class DFlash2Model(Model):
         for idx in range(config.num_hidden_layers):
             window_left, window_right = config.block_window(idx)
 
-            attn = Attention(
+            # Sliding-window layers keep a window ring per sequence (see DFlashModel); -swa_full
+            # keeps the paged cache
+            swa = config.layer_types[idx] == "sliding_attention" and not swa_full
+            attn = (SlidingAttention if swa else Attention)(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -217,6 +223,13 @@ class DFlash2Model(Model):
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
+        self.recurrent_state_cls = None
+        if any(isinstance(m, SlidingAttention) for m in self.attn_modules):
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.attached_model = None
 
@@ -226,10 +239,6 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
-        if target.loaded_tp:
-            raise NotImplementedError(
-                "DFlash2 does not support tensor-parallel targets because the selector needs top-k logits"
-            )
         if target.config.vocab_size != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
@@ -272,14 +281,49 @@ class DFlash2Model(Model):
         anchor. The selector is greedy; sampling remains lossless because the
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
-        lm = target.modules[target.logit_layer_idx]
-        logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
-
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
         anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
         export_conf = params.get("export_draft_conf", False)
+        if target.loaded_tp:
+            # Tensor-parallel target: each rank takes the selector's top-k over its vocabulary slice of
+            # the head and the candidates are merged on the output device, so only k ids and scores per
+            # row cross the ranks, never the logits. The drafter stays on one device
+            staged = target.tp_producer.send(state[:, 1:].half())
+            unary, cands = target.tp_dispatch_lm_head_topk(
+                (staged, {}), self.selector.top_k,
+                scale = self.config.output_multiplier, softcap = self.config.final_logit_softcapping or 0.0,
+            )
+            out, confidence = self.selector.walk_candidates(
+                to_device(state[:, 1:], dev), to_device(unary, dev), to_device(cands, dev), anchor,
+                return_confidence = export_conf,
+            )
+            if export_conf:
+                params["draft_conf"] = confidence
+            return out
+
+        lm = target.modules[target.logit_layer_idx]
+        sh = lm.sparse_head
+        flag = params.get("sparse_head") if sh is not None else None
+        if flag is True and sh.ready:
+            # Draft-only sparse vocabulary subset: its top-k candidates go through the same selector walk
+            unary, cands = sh.topk(
+                lm.prepare_for_device(state[:, 1:].half(), params), self.selector.top_k,
+                scale = self.config.output_multiplier, softcap = self.config.final_logit_softcapping or 0.0,
+            )
+            out, confidence = self.selector.walk_candidates(
+                to_device(state[:, 1:], dev), to_device(unary, dev), to_device(cands, dev), anchor,
+                return_confidence = export_conf,
+            )
+            if export_conf:
+                params["draft_conf"] = confidence
+            return out
+        logits = lm.prepare_for_device(state.half(), params)
+        logits = lm.forward(logits, params)
+        if flag == "probe":
+            full_ids = torch.argmax(logits[:, 1:, :target.config.vocab_size], dim = -1)
+            sparse_ids, _ = sh.argmax(lm.prepare_for_device(state[:, 1:].half(), params))
+            sh.record_probe(full_ids, sparse_ids)
         # [anchor, path...] and [0, score...] straight from the selector, in the block layout
         # the generator consumes. The head's padded width, the output multiplier and the
         # softcap (Gemma-class targets) are handled inside the selector's top-k. The state
@@ -313,7 +357,10 @@ class DFlash2Model(Model):
         # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
         # flag is only needed when every layer is causal; windowed layers carry their own bounds
         params["causal"] = self.config.is_causal is True
-        return prepare_for_attn(input_ids, params)
+        input_ids = prepare_for_attn(input_ids, params)
+        if self.recurrent_state_cls is not None:
+            prepare_for_recurrence(input_ids, params, self)
+        return input_ids
 
 
     @override
@@ -327,7 +374,7 @@ class DFlash2Model(Model):
         # Encoder norm (stored in DFlashInputLayer under a key that doesn't match the fc module
         # prefix), conv base kernels and selector codebooks: raw tensors outside any Linear
         tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
-        tensors.update(config.stc.list_tensors(prefix = "candidate_selector."))
+        tensors.update(config.stc.list_tensors(prefix = "candidate_selector"))
         for idx in range(config.num_hidden_layers):
             for conv in ("attention_conv", "mlp_conv"):
                 tensors.update(config.stc.list_tensors(

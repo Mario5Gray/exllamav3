@@ -155,7 +155,10 @@ BC_Attention::BC_Attention
         qkv_n_stride = meta.select(0, 3).contiguous().to(dev);
         qkv_had_src = meta.select(0, 4).contiguous().to(dev);
         int width = meta[2][0].item<int>();
-        qkv_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kHalf).device(dev));
+        // Sliced mode writes every slice through qkv_c_ptrs, so the carrier is never touched and
+        // needs no backing beyond one element: a zero-stride expansion to the shape mgemm checks
+        qkv_carrier = at::empty({1, 1, 1}, at::TensorOptions().dtype(at::kHalf).device(dev))
+                      .expand({slices, MAX_BSZ * MAX_QLEN, width});
     }
 }
 
@@ -211,6 +214,7 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_update,
     int block_n,
     int splits_cap,
+    int programs,
     c10::optional<at::Tensor> xp,
     c10::optional<at::Tensor> yp
 )
@@ -313,11 +317,9 @@ void BC_Attention::configure_slot
         s.qkv_c_ptrs = at::tensor(ptrs, at::TensorOptions().dtype(at::kLong)).to(s.q.device());
     }
 
-    int group_size = num_q_heads / num_kv_heads;
-    int block_m = 1; while (block_m < q_len) block_m <<= 1;
-    int block_h = MAX(16 / block_m, 1);
-    int h_blocks = CEIL_DIVIDE(group_size, block_h);
-    s.programs = bsz * num_kv_heads * h_blocks;
+    // Split / combine grid width: the row layout is the Python side's (triton_paged.decode_row_layout),
+    // which compiled the kernels for it
+    s.programs = programs;
     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
 
     s.graph = std::make_unique<Graph>();
@@ -698,7 +700,14 @@ void BC_Attention::run_gr
                 graph->record_param(s.k_qsa_fewq->handle(), GP_end, 0);
             }
         }
-        dsa_topk_gr(s.qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
+        // Eager calls scan only the freshly scored [0, t_scan): the static's tail can hold
+        // scores from an earlier, longer sequence. Graphs patch the scan width per replay
+        const at::Tensor qsa_scores = graph ? s.qsa_scores : s.qsa_scores.narrow(1, 0, t_scan);
+        // See BC_MLAttention::run_gr: the eager pass has to allocate the split top-k workspace the captured
+        // full-width scan will use
+        if (!graph)
+            dsa_topk_prepare(s.qsa_scores, (int) s.qsa_pool_idx.size(1));
+        dsa_topk_gr(qsa_scores, s.qsa_pool_idx, qsa_topk, graph);
         {
             std::vector<void*> args =
             {
@@ -871,8 +880,9 @@ void BC_Attention::run
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;
@@ -881,9 +891,9 @@ void BC_Attention::run
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        GraphCapture capture(*s.graph);
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
         s.runs = 2;
     }
 
