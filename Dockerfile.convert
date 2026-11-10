@@ -30,7 +30,7 @@ RUN python3.12 -m venv "${VIRTUAL_ENV}" \
         --index-url "${PYTORCH_CUDA_INDEX}" \
         "torch==${TORCH_VERSION}"
 
-COPY setup.py MANIFEST.in ./
+COPY pyproject.toml README.md setup.py ./
 COPY exllamav3 ./exllamav3
 
 RUN python -m pip install --no-cache-dir .
